@@ -16,7 +16,10 @@ curl -fsSL https://github.com/Nix4Loong/nix4loong-infect/raw/refs/heads/main/nix
 
 ### Environment variables
 
-- `doNetConf` — when non-empty, capture the host's current interface addresses, gateways, nameservers, and MAC-to-ifname rules into `/etc/nixos/networking.nix` and import it. ⚠️ **Required** if the host uses a **static IP** (otherwise NixOS's default DHCP will pick up nothing and you lose the box). Safe to leave unset on DHCP-configured hosts.
+- `doNetConf` — when non-empty, capture the host's current interface addresses, gateways, nameservers, and MAC-to-ifname rules into `/etc/nixos/networking.nix` and import it.
+
+    ⚠️ **Required** if the host uses a **static IP** (otherwise NixOS's default DHCP will pick up nothing and you lose the box). Safe to leave unset on DHCP-configured hosts.
+
 - `NIX_INSTALL_URL` — override installer URL (default `https://install.nix4loong.cn`).
 - `NIX_CHANNEL_URL` — override channel URL (default `https://download.nix4loong.cn/nix-channels/loong-master`). Accepts a full URL, unlike upstream's `NIX_CHANNEL` which takes a name.
 - `NIXOS_CONFIG` — path or HTTP URL of a pre-baked `configuration.nix`. When set, `makeConf` still writes the default config first, then this replaces it inside `infect`.
