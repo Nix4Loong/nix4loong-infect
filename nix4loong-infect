@@ -1,0 +1,450 @@
+#! /usr/bin/env bash
+
+# More info at: https://github.com/darkyzhou/nix4loong-infect
+# Based on https://github.com/elitak/nixos-infect, adapted for loongarch64 + nix4loong.
+
+set -e -o pipefail
+
+makeConf() {
+  # Skip everything if main config already present
+  [[ -e /etc/nixos/configuration.nix ]] && return 0
+
+  # NB <<"EOF" quotes / $ ` in heredocs, <<EOF does not
+  mkdir -p /etc/nixos
+  # Prevent grep for sending error code 1 (and halting execution) when no lines are selected : https://www.unix.com/man-page/posix/1P/grep
+  local IFS=$'\n'
+  for trypath in /root/.ssh/authorized_keys /home/$SUDO_USER/.ssh/authorized_keys $HOME/.ssh/authorized_keys; do
+      [[ -r "$trypath" ]] \
+      && keys=$(sed -E 's/^[^#].*[[:space:]]((sk-ssh|sk-ecdsa|ssh|ecdsa)-[^[:space:]]+)[[:space:]]+([^[:space:]]+)([[:space:]]*.*)$/\1 \3\4/' "$trypath") \
+      && [[ ! -z "$keys" ]] \
+      && break
+  done
+
+  hostDomain="$(hostname -d 2>/dev/null || true)"
+  # `hostname -d` emits the literal string "(none)" when no domain is set;
+  # treat that as "no domain" so we don't poison NixOS's resolv.conf.
+  [[ "$hostDomain" == "(none)" ]] && hostDomain=""
+  if [[ -n "$hostDomain" ]]; then
+    domainLine="networking.domain = \"$hostDomain\";"
+  else
+    domainLine=""
+  fi
+
+  local network_import=""
+  [[ -n "$doNetConf" ]] && network_import="./networking.nix # generated at runtime by nix4loong-infect"
+
+  cat > /etc/nixos/configuration.nix << EOF
+{ ... }: {
+  imports = [
+    ./hardware-configuration.nix
+    $network_import
+    $NIXOS_IMPORT
+  ];
+
+  # Workaround for https://github.com/NixOS/nix/issues/8502
+  services.logrotate.checkConfig = false;
+
+  # Lustrate (used by nixos-infect on first boot) is not compatible with
+  # systemd-based initrd — systemd PID1 inside the initrd fails to find
+  # default.target and freezes. Must stay false for the initial boot;
+  # re-enable after the system comes up if you want systemd initrd features.
+  # https://nixos.org/manual/nixos/stable/#sec-installing-from-other-distro
+  boot.initrd.systemd.enable = false;
+
+  boot.tmp.cleanOnBoot = true;
+  zramSwap.enable = ${zramswap};
+  networking.hostName = "$(hostname -s)";
+  $domainLine
+  services.openssh.enable = true;
+  users.users.root.openssh.authorizedKeys.keys = [$(while read -r line; do
+    line=$(echo -n "$line" | sed 's/\r//g')
+    trimmed_line=$(echo -n "$line" | xargs)
+    echo -n "''$trimmed_line'' "
+  done <<< "$keys")];
+
+  nix.settings = {
+    extra-substituters = [ "https://cache.nix4loong.cn" ];
+    extra-trusted-public-keys = [
+      "cache.nix4loong.cn-1:zmkwLihdSUyy6OFSVgvK3br0EaUEczLiJgDfvOmm3pA="
+    ];
+  };
+
+  # Otherwise NixOS activation pins /root/.nix-channels to the upstream
+  # nixos-unstable URL, overwriting what nix4loong-infect installed.
+  system.defaultChannel = "$NIX_CHANNEL_URL";
+
+  system.stateVersion = "26.05";
+}
+EOF
+
+  if isEFI; then
+    bootcfg=$(cat << EOF
+  boot.loader.grub = {
+    enable = true;
+    efiSupport = true;
+    efiInstallAsRemovable = true;
+    device = "nodev";
+  };
+  boot.loader.efi.efiSysMountPoint = "$bootFs";
+  fileSystems."$bootFs" = { device = "$esp"; fsType = "vfat"; };
+EOF
+)
+  else
+    bootcfg=$(cat << EOF
+  boot.loader.grub.device = "$grubdev";
+EOF
+)
+  fi
+
+  # initrd safety net: cover the common storage/USB/network drivers across
+  # VMs (virtio), plain-SATA hosts (ahci) and physical boxes. Unused modules
+  # in the list are silently skipped at boot. Most of these are already
+  # builtin in the loong-master kernel, so the list just guarantees they're
+  # also available from initrd if initrd needs them before pivot_root.
+  availableKernelModules=(
+    '"virtio_pci"' '"virtio_blk"' '"virtio_net"' '"virtio_scsi"'
+    '"ahci"' '"sd_mod"' '"xhci_pci"' '"usb_storage"' '"nvme"'
+  )
+
+  # If you rerun this later, be sure to prune the filesSystems attr
+  cat > /etc/nixos/hardware-configuration.nix << EOF
+{ modulesPath, ... }:
+{
+  imports = [ (modulesPath + "/profiles/qemu-guest.nix") ];
+$bootcfg
+  boot.initrd.availableKernelModules = [ ${availableKernelModules[@]} ];
+  boot.initrd.kernelModules = [ "nvme" ];
+  fileSystems."/" = { device = "$rootfsdev"; fsType = "$rootfstype"; };
+  $swapcfg
+}
+EOF
+
+  [[ -n "$doNetConf" ]] && makeNetworkingConf || true
+}
+
+makeNetworkingConf() {
+  # XXX It'd be better if we used procfs for all this...
+  local IFS=$'\n'
+  eth0_name=$(ip address show | grep '^2:' | awk -F': ' '{print $2}')
+  eth0_ip4s=$(ip address show dev "$eth0_name" | grep 'inet ' | sed -r 's|.*inet ([0-9.]+)/([0-9]+).*|{ address="\1"; prefixLength=\2; }|')
+  eth0_ip6s=$(ip address show dev "$eth0_name" | grep 'inet6 ' | sed -r 's|.*inet6 ([0-9a-f:]+)/([0-9]+).*|{ address="\1"; prefixLength=\2; }|' || '')
+  gateway=$(ip route show dev "$eth0_name" | grep default | sed -r 's|default via ([0-9.]+).*|\1|')
+  gateway6=$(ip -6 route show dev "$eth0_name" | grep default | sed -r 's|default via ([0-9a-f:]+).*|\1|' || true)
+  ether0=$(ip address show dev "$eth0_name" | grep link/ether | sed -r 's|.*link/ether ([0-9a-f:]+) .*|\1|')
+
+  eth1_name=$(ip address show | grep '^3:' | awk -F': ' '{print $2}') || true
+  if [ -n "$eth1_name" ]; then
+    eth1_ip4s=$(ip address show dev "$eth1_name" | grep 'inet ' | sed -r 's|.*inet ([0-9.]+)/([0-9]+).*|{ address="\1"; prefixLength=\2; }|')
+    eth1_ip6s=$(ip address show dev "$eth1_name" | grep 'inet6 ' | sed -r 's|.*inet6 ([0-9a-f:]+)/([0-9]+).*|{ address="\1"; prefixLength=\2; }|' || '')
+    ether1=$(ip address show dev "$eth1_name" | grep link/ether | sed -r 's|.*link/ether ([0-9a-f:]+) .*|\1|')
+    interfaces1=$(cat << EOF
+      $eth1_name = {
+        ipv4.addresses = [$(for a in "${eth1_ip4s[@]}"; do echo -n "
+          $a"; done)
+        ];
+        ipv6.addresses = [$(for a in "${eth1_ip6s[@]}"; do echo -n "
+          $a"; done)
+        ];
+        };
+EOF
+)
+    extraRules1="ATTR{address}==\"${ether1}\", NAME=\"${eth1_name}\""
+  else
+    interfaces1=""
+    extraRules1=""
+  fi
+
+  readarray nameservers < <(grep ^nameserver /etc/resolv.conf | sed -r \
+    -e 's/^nameserver[[:space:]]+([0-9.a-fA-F:]+).*/"\1"/' \
+    -e 's/127[0-9.]+/8.8.8.8/' \
+    -e 's/::1/8.8.8.8/')
+
+  if [[ "$eth0_name" = eth* ]]; then
+    predictable_inames="usePredictableInterfaceNames = lib.mkForce false;"
+  else
+    predictable_inames="usePredictableInterfaceNames = lib.mkForce true;"
+  fi
+
+  # upstream nixos-infect emits `address = ""` when there is no IPv6 default
+  # gateway/route; that triggers eval errors on NixOS ≥ 25.x. Skip those
+  # stanzas entirely when gateway6 is empty.
+  if [[ -n "$gateway6" ]]; then
+    defaultGateway6Stanza=$(cat << EOF
+    defaultGateway6 = {
+      address = "${gateway6}";
+      interface = "${eth0_name}";
+    };
+EOF
+)
+    ipv6RoutesStanza="        ipv6.routes = [ { address = \"${gateway6}\"; prefixLength = 128; } ];"
+  else
+    defaultGateway6Stanza=""
+    ipv6RoutesStanza=""
+  fi
+
+  cat > /etc/nixos/networking.nix << EOF
+{ lib, ... }: {
+  # This file was populated at runtime with the networking
+  # details gathered from the active system.
+  networking = {
+    nameservers = [ ${nameservers[@]} ];
+    defaultGateway = "${gateway}";
+$defaultGateway6Stanza
+    dhcpcd.enable = false;
+    $predictable_inames
+    interfaces = {
+      $eth0_name = {
+        ipv4.addresses = [$(for a in "${eth0_ip4s[@]}"; do echo -n "
+          $a"; done)
+        ];
+        ipv6.addresses = [$(for a in "${eth0_ip6s[@]}"; do echo -n "
+          $a"; done)
+        ];
+        ipv4.routes = [ { address = "${gateway}"; prefixLength = 32; } ];
+$ipv6RoutesStanza
+      };
+      $interfaces1
+    };
+  };
+  services.udev.extraRules = ''
+    ATTR{address}=="${ether0}", NAME="${eth0_name}"
+    $extraRules1
+  '';
+}
+EOF
+}
+
+checkExistingSwap() {
+  SWAPSHOW=$(swapon --show --noheadings --raw)
+  zramswap=true
+  swapcfg=""
+  if [[ -n "$SWAPSHOW" ]]; then
+    SWAP_DEVICE="${SWAPSHOW%% *}"
+    if [[ "$SWAP_DEVICE" == "/dev/"* ]]; then
+      zramswap=false
+      swapcfg="swapDevices = [ { device = \"${SWAP_DEVICE}\"; } ];"
+      NO_SWAP=true
+    fi
+  fi
+}
+
+makeSwap() {
+  swapFile=$(mktemp /tmp/nix4loong-infect.XXXXX.swp)
+  dd if=/dev/zero "of=$swapFile" bs=1M count=$((1*1024))
+  chmod 0600 "$swapFile"
+  mkswap "$swapFile"
+  swapon -v "$swapFile"
+}
+
+removeSwap() {
+  swapoff -a
+  rm -vf /tmp/nix4loong-infect.*.swp
+}
+
+isEFI() {
+  [ -d /sys/firmware/efi ]
+}
+
+findESP() {
+  esp=""
+  for d in /boot/EFI /boot/efi /boot /efi; do
+    [[ ! -d "$d" ]] && continue
+    [[ "$d" == "$(df "$d" --output=target | sed 1d)" ]] \
+      && esp="$(df "$d" --output=source | sed 1d)" \
+      && break
+  done
+  [[ -z "$esp" ]] && { echo "WARNING: No ESP mount point found"; return 1; }
+  for uuid in /dev/disk/by-uuid/*; do
+    [[ $(readlink -f "$uuid") == "$esp" ]] && echo $uuid && return 0
+  done
+}
+
+prepareEnv() {
+  # $esp and $grubdev are used in makeConf()
+  if isEFI; then
+    esp="$(findESP)"
+    if mount | grep -qE " on /boot/efi type "; then
+      bootFs=/boot/efi
+    elif mount | grep -qE " on /boot/EFI type "; then
+      bootFs=/boot/EFI
+    elif mount | grep -qE " on /efi type "; then
+      bootFs=/efi
+    else
+      bootFs=/boot
+    fi
+  else
+    for grubdev in /dev/vda /dev/sda /dev/xvda /dev/nvme0n1 ; do [[ -e $grubdev ]] && break; done
+  fi
+
+  # Retrieve root fs block device
+  #                   (get root mount)  (get partition or logical volume)
+  rootfsdev=$(mount | grep "on / type" | awk '{print $1;}')
+  rootfstype=$(df $rootfsdev --output=fstype | sed 1d)
+
+  export USER="root"
+  export HOME="/root"
+
+  # shellcheck disable=SC2174
+  mkdir -p -m 0755 /nix
+}
+
+fakeCurlUsingWget() {
+  # Use adapted wget if curl is missing
+  which wget && { \
+    curl() {
+      eval "wget $(
+        (local isStdout=1
+        for arg in "$@"; do
+          case "$arg" in
+            "-o")
+              echo "-O";
+              isStdout=0
+              ;;
+            "-O")
+              isStdout=0
+              ;;
+            "-L")
+              ;;
+            *)
+              echo "$arg"
+              ;;
+          esac
+        done;
+        [[ $isStdout -eq 1 ]] && echo "-O-"
+        )| tr '\n' ' '
+      )"
+    }; export -f curl; }
+}
+
+req() {
+  type "$1" > /dev/null 2>&1 || which "$1" > /dev/null 2>&1
+}
+
+checkEnv() {
+  [[ "$(whoami)" == "root" ]] || { echo "ERROR: Must run as root"; return 1; }
+  [[ "$(uname -m)" == "loongarch64" ]] \
+    || { echo "ERROR: This script targets loongarch64; uname -m reports '$(uname -m)'"; return 1; }
+
+  # Perform some easy fixups before checking
+  (which dnf && dnf install -y perl-Digest-SHA) || true # Fedora 24
+  which bzcat || (which yum && yum install -y bzip2) \
+              || (which apt-get && apt-get update && apt-get install -y bzip2) \
+              || (which oma && oma install -y bzip2) \
+              || (which pacman && pacman -S --noconfirm bzip2) \
+              || true
+  which xzcat || (which yum && yum install -y xz) \
+              || (which apt-get && apt-get update && apt-get install -y xz-utils) \
+              || (which oma && oma install -y xz) \
+              || (which pacman && pacman -S --noconfirm xz) \
+              || true
+  which curl  || fakeCurlUsingWget \
+              || (which apt-get && apt-get update && apt-get install -y curl) \
+              || (which oma && oma install -y curl) \
+              || (which pacman && pacman -S --noconfirm curl) \
+              || true
+  which tar || (which yum && yum install -y tar) \
+            || (which apt-get && apt-get update && apt-get install -y tar) \
+            || (which oma && oma install -y tar) \
+            || (which pacman && pacman -S --noconfirm tar) \
+            || true
+
+  req curl || req wget || { echo "ERROR: Missing both curl and wget";  return 1; }
+  req bzcat            || { echo "ERROR: Missing bzcat";               return 1; }
+  req xzcat            || { echo "ERROR: Missing xzcat";               return 1; }
+  req groupadd         || { echo "ERROR: Missing groupadd";            return 1; }
+  req useradd          || { echo "ERROR: Missing useradd";             return 1; }
+  req ip               || { echo "ERROR: Missing ip";                  return 1; }
+  req awk              || { echo "ERROR: Missing awk";                 return 1; }
+  req cut || req df    || { echo "ERROR: Missing coreutils (cut, df)"; return 1; }
+  req tar              || { echo "ERROR: Missing tar";                 return 1; }
+
+  # On some versions of Oracle Linux these have the wrong permissions,
+  # which stops sshd from starting when NixOS boots
+  chmod 600 /etc/ssh/ssh_host_*_key 2>/dev/null || true
+}
+
+infect() {
+  # experimental-nix-installer creates nixbld group + 32 build users itself;
+  # no need to pre-create them.
+
+  # --no-add-channel: we add the channel ourselves below under the name
+  #                   `nixos` (required for `<nixpkgs/nixos>` resolution);
+  #                   letting the installer add its own `nixpkgs` channel
+  #                   leaves a duplicate behind.
+  curl --proto '=https' --tlsv1.2 -sSf -L "$NIX_INSTALL_URL" \
+    | sh -s -- install --no-confirm --no-add-channel
+
+  # shellcheck disable=SC1091
+  if [ -e /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh ]; then
+    . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
+  elif [ -e "$HOME/.nix-profile/etc/profile.d/nix.sh" ]; then
+    # shellcheck disable=SC1091
+    . "$HOME/.nix-profile/etc/profile.d/nix.sh"
+  fi
+
+  nix-channel --add "$NIX_CHANNEL_URL" nixos
+  nix-channel --update
+
+  if [[ $NIXOS_CONFIG = http* ]]
+  then
+    curl -L $NIXOS_CONFIG -o /etc/nixos/configuration.nix
+    unset NIXOS_CONFIG
+  fi
+
+  export NIXOS_CONFIG="${NIXOS_CONFIG:-/etc/nixos/configuration.nix}"
+
+  nix-env --set \
+    -I nixpkgs=$(realpath $HOME/.nix-defexpr/channels/nixos) \
+    -f '<nixpkgs/nixos>' \
+    -p /nix/var/nix/profiles/system \
+    -A system
+
+  # Drop leftovers from the experimental-nix-installer uninstall path; without
+  # this they linger in / and break nothing, but they're dead weight on NixOS.
+  # (Skip the classic `rm /nix/var/nix/profiles/default*` + `nix-collect-garbage`
+  # dance from upstream nixos-infect — in daemon-mode Nix the daemon is still
+  # holding those paths open; lustrate + reboot handles the cleanup for us.)
+  rm -f /nix/receipt.json /nix/nix-installer
+
+  # Reify resolv.conf
+  [[ -L /etc/resolv.conf ]] && mv -v /etc/resolv.conf /etc/resolv.conf.lnk && cat /etc/resolv.conf.lnk > /etc/resolv.conf
+
+  # Stage the Nix coup d'état
+  touch /etc/NIXOS
+  echo etc/nixos                  >> /etc/NIXOS_LUSTRATE
+  echo etc/resolv.conf            >> /etc/NIXOS_LUSTRATE
+  echo root/.nix-defexpr/channels >> /etc/NIXOS_LUSTRATE
+  (cd / && ls etc/ssh/ssh_host_*_key* || true) >> /etc/NIXOS_LUSTRATE
+
+  if isEFI; then
+    [[ -n "$bootFs" && -d "$bootFs" ]] || { echo "ERROR: bootFs unset/missing, refusing to touch ESP"; return 1; }
+    rm -rf "$bootFs.bak"
+    umount "$esp"
+    mv -v "$bootFs" "$bootFs.bak" || { cp -a "$bootFs" "$bootFs.bak" ; rm -rf "${bootFs:?}"/* ; umount "$bootFs" ; }
+    mkdir -p "$bootFs"
+    mount "$esp" "$bootFs"
+    find "$bootFs" -depth ! -path "$bootFs" -exec rm -rf {} +
+  fi
+  /nix/var/nix/profiles/system/bin/switch-to-configuration boot
+}
+
+NIX_INSTALL_URL="${NIX_INSTALL_URL:-https://install.nix4loong.cn}"
+NIX_CHANNEL_URL="${NIX_CHANNEL_URL:-https://download.nix4loong.cn/nix-channels/loong-master}"
+
+checkEnv
+prepareEnv
+checkExistingSwap
+if [[ -z "$NO_SWAP" ]]; then
+    makeSwap # smallest (512MB) droplet needs extra memory!
+fi
+makeConf
+if [[ -z "$NO_INFECT" ]]; then
+    infect
+fi
+if [[ -z "$NO_SWAP" ]]; then
+    removeSwap
+fi
+
+if [[ -z "$NO_REBOOT" ]]; then
+  reboot
+fi
